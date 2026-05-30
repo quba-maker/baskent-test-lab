@@ -1,0 +1,297 @@
+import { withTenantDB } from "@/lib/core/tenant-db";
+import { logger } from "@/lib/core/logger";
+import { decryptPayload, EncryptedPayload } from "@/lib/core/encryption";
+
+// ==========================================
+// QUBA AI OS — Multi-Tenant Runtime Resolver
+// ==========================================
+// Webhook payload'ından tenant'ı çözer.
+// Tüm downstream servisler bu config'i tüketir.
+// Global env singleton'larını tamamen ortadan kaldırır.
+// ==========================================
+
+export interface TenantRuntimeConfig {
+  // Identity
+  tenantId: string;
+  tenantSlug: string;
+  name: string;
+
+  // New Channel Architecture
+  channelId: string;
+  groupId: string;
+  provider: string; // 'whatsapp' | 'messenger' | 'instagram'
+
+  // Meta App Credentials (tenant-isolated, for validating webhook signature)
+  metaAppId: string | null;
+  metaAppSecret: string | null;
+  instagramAppSecret: string | null;
+
+  // Channel Specific
+  identifier: string; // The phone number id or page id
+  accessToken: string | null; // Extracted from channel_integrations.credentials_encrypted if JSON
+
+  // Legacy mappings for backwards compatibility during migration
+  whatsappPhoneNumberId: string | null;
+  whatsappBusinessAccountId: string | null;
+  metaPageId: string | null;
+  instagramId: string | null;
+
+  // Plan & Status
+  plan: string;
+  status: string;
+
+  // Raw DB row
+  raw: Record<string, any>;
+}
+
+export interface TenantIdentifier {
+  type: 'whatsapp' | 'messenger' | 'instagram';
+  id: string;
+  source: string;
+  wabaId?: string; // Optional: WhatsApp Business Account ID fallback
+}
+
+export class TenantResolverService {
+  private log = logger.withContext({ module: 'TenantResolver' });
+
+  /**
+   * Webhook payload'ından tenant tanımlayıcıları çıkarır.
+   */
+  extractIdentifiers(body: any): TenantIdentifier | null {
+    if (!body?.object || !body?.entry?.[0]) return null;
+
+    // 1. WHATSAPP
+    if (body.object === 'whatsapp_business_account') {
+      const phoneId = body.entry?.[0]?.changes?.[0]?.value?.metadata?.phone_number_id;
+      const wabaId = body.entry?.[0]?.id;
+      if (phoneId) {
+        return { type: 'whatsapp', id: phoneId, source: 'metadata.phone_number_id', wabaId };
+      }
+    }
+
+    // 2. MESSENGER / PAGE
+    if (body.object === 'page') {
+      const pageId = body.entry?.[0]?.id;
+      if (pageId) {
+        return { type: 'messenger', id: pageId, source: 'entry.id (page)' };
+      }
+    }
+
+    // 3. INSTAGRAM
+    if (body.object === 'instagram') {
+      const igId = body.entry?.[0]?.id;
+      if (igId) {
+        return { type: 'instagram', id: igId, source: 'entry.id (instagram)' };
+      }
+    }
+
+    return null;
+  }
+
+  /**
+   * Webhook payload'ından tenant'ı çözer.
+   * DB lookup → TenantRuntimeConfig döner.
+   */
+  async resolve(body: any): Promise<TenantRuntimeConfig | null> {
+    const startTime = Date.now();
+    const identifier = this.extractIdentifiers(body);
+
+    if (!identifier) {
+      this.log.warn('Cannot extract tenant identifier from webhook payload', {
+        bodyObject: body?.object,
+        hasEntry: !!body?.entry?.[0]
+      });
+      return null;
+    }
+
+    try {
+      const db = withTenantDB('admin-system', true);
+
+      // Map webhook identifier type to DB provider names
+      const providerMap: Record<string, string[]> = {
+        'whatsapp': ['whatsapp'],
+        'messenger': ['messenger', 'meta_messenger'],
+        'instagram': ['instagram', 'meta_instagram'],
+      };
+      const providerValues = providerMap[identifier.type] || [identifier.type];
+
+      // NEW V2 ROUTING: Look up via channels -> channel_groups -> tenants
+      let results = await db.executeSafe({
+        text: `
+          SELECT 
+            c.id as channel_id,
+            c.provider,
+            c.identifier,
+            cg.id as group_id,
+            t.id as tenant_id,
+            t.slug as tenant_slug,
+            t.name as tenant_name,
+            t.meta_app_id,
+            t.meta_app_secret,
+            t.instagram_app_secret,
+            t.plan,
+            t.status,
+            t.whatsapp_phone_id,
+            t.whatsapp_business_id,
+            t.meta_page_id,
+            t.instagram_id,
+            ci.credentials_encrypted
+          FROM channels c
+          JOIN channel_groups cg ON c.group_id = cg.id
+          JOIN tenants t ON cg.tenant_id = t.id
+          LEFT JOIN channel_integrations ci ON ci.channel_id = c.id
+          WHERE c.identifier = $1 
+            AND c.provider = ANY($2)
+            AND t.status = 'active'
+          LIMIT 1
+        `,
+        values: [identifier.id, providerValues]
+      }) as any[];
+
+      // FALLBACK TO LEGACY V1 ROUTING (Quarantine — disabled by default)
+      // Gate: USE_V1_TENANT_ROUTING_FALLBACK=true to re-enable
+      if (results.length === 0 && process.env.USE_V1_TENANT_ROUTING_FALLBACK === 'true') {
+        let legacyResults: any[] = [];
+        if (identifier.type === 'whatsapp') {
+          legacyResults = await db.executeSafe({
+            text: `SELECT * FROM tenants WHERE whatsapp_phone_id = $1 AND status = 'active' LIMIT 1`,
+            values: [identifier.id]
+          }) as any[];
+          if (legacyResults.length === 0 && identifier.wabaId) {
+            legacyResults = await db.executeSafe({
+              text: `SELECT * FROM tenants WHERE whatsapp_business_id = $1 AND status = 'active' LIMIT 1`,
+              values: [identifier.wabaId]
+            }) as any[];
+          }
+        } else if (identifier.type === 'messenger') {
+          legacyResults = await db.executeSafe({
+            text: `SELECT * FROM tenants WHERE meta_page_id = $1 AND status = 'active' LIMIT 1`,
+            values: [identifier.id]
+          }) as any[];
+        } else if (identifier.type === 'instagram') {
+          legacyResults = await db.executeSafe({
+            text: `SELECT * FROM tenants WHERE instagram_id = $1 AND status = 'active' LIMIT 1`,
+            values: [identifier.id]
+          }) as any[];
+        }
+
+        if (legacyResults.length > 0) {
+          const t = legacyResults[0];
+          this.log.warn('[V1_TENANT_ROUTING_USED] Legacy V1 routing activated via flag', {
+            tenantId: t.id,
+            tenantSlug: t.slug,
+            identifierId: identifier.id
+          });
+          
+          return {
+            tenantId: t.id,
+            tenantSlug: t.slug,
+            name: t.name,
+            channelId: 'legacy_unmapped',
+            groupId: 'legacy_unmapped',
+            provider: identifier.type,
+            metaAppId: t.meta_app_id || null,
+            metaAppSecret: t.meta_app_secret || null,
+            instagramAppSecret: t.instagram_app_secret || null,
+            identifier: identifier.id,
+            accessToken: t.meta_page_token || null,
+            whatsappPhoneNumberId: t.whatsapp_phone_id || null,
+            whatsappBusinessAccountId: t.whatsapp_business_id || null,
+            metaPageId: t.meta_page_id || null,
+            instagramId: t.instagram_id || null,
+            plan: t.plan || 'starter',
+            status: t.status,
+            raw: t
+          };
+        }
+      } else if (results.length === 0) {
+        this.log.warn('[TENANT_RESOLUTION_V2_ONLY] No V2 channel match, V1 fallback disabled', {
+          identifierType: identifier.type,
+          identifierId: identifier.id,
+          identifierSource: identifier.source
+        });
+      }
+
+      const durationMs = Date.now() - startTime;
+
+      if (results.length === 0) {
+        this.log.warn('No matching active tenant/channel found', {
+          identifierType: identifier.type,
+          identifierId: identifier.id,
+          identifierSource: identifier.source,
+          durationMs
+        });
+        return null;
+      }
+
+      const row = results[0];
+      
+      // Attempt to extract access token from credentials (supports encrypted envelope, plain JSON, and raw string)
+      let accessToken = null;
+      try {
+        if (row.credentials_encrypted) {
+          const parsed = JSON.parse(row.credentials_encrypted);
+          
+          // Encrypted envelope: { version, provider, encrypted_payload }
+          if (parsed.encrypted_payload && parsed.version) {
+            try {
+              const decrypted = decryptPayload(parsed as EncryptedPayload);
+              accessToken = decrypted.access_token || decrypted.accessToken || decrypted.page_token || null;
+            } catch (decryptErr) {
+              this.log.error("[RESOLVER_DECRYPT_FAILED]", decryptErr instanceof Error ? decryptErr : new Error(String(decryptErr)));
+            }
+          }
+          // Plain JSON: { accessToken: "..." }
+          else if (parsed.accessToken) {
+            accessToken = parsed.accessToken;
+          }
+        }
+      } catch (e) {
+        // Raw string token (not JSON)
+        accessToken = row.credentials_encrypted;
+      }
+
+      // If no token in integration, fallback to legacy tenant token
+      if (!accessToken && identifier.type === 'whatsapp') accessToken = row.whatsapp_business_id ? row.meta_page_token : null; // Typically same token
+
+      const runtime: TenantRuntimeConfig = {
+        tenantId: row.tenant_id,
+        tenantSlug: row.tenant_slug,
+        name: row.tenant_name,
+        channelId: row.channel_id,
+        groupId: row.group_id,
+        provider: row.provider,
+        metaAppId: row.meta_app_id || null,
+        metaAppSecret: row.meta_app_secret || null,
+        instagramAppSecret: row.instagram_app_secret || null,
+        identifier: row.identifier,
+        accessToken: accessToken,
+        whatsappPhoneNumberId: row.whatsapp_phone_id || null,
+        whatsappBusinessAccountId: row.whatsapp_business_id || null,
+        metaPageId: row.meta_page_id || null,
+        instagramId: row.instagram_id || null,
+        plan: row.plan || 'starter',
+        status: row.status,
+        raw: row
+      };
+
+      this.log.info('Tenant resolved (V2)', {
+        tenantSlug: runtime.tenantSlug,
+        channelId: runtime.channelId,
+        provider: runtime.provider,
+        durationMs
+      });
+
+      return runtime;
+
+    } catch (error: any) {
+      this.log.error('Tenant resolution failed', error, {
+        identifierType: identifier.type,
+        identifierId: identifier.id
+      });
+      return null;
+    }
+  }
+}
+
+
